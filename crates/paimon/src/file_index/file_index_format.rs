@@ -265,12 +265,52 @@ impl FileIndex {
     }
 }
 
+/// An in-memory [`FileRead`] over owned bytes, so an index embedded in a manifest entry (or a
+/// sidecar already read whole) parses through the same format reader as an index file.
+struct BytesRead(Bytes);
+
+#[async_trait::async_trait]
+impl FileRead for BytesRead {
+    async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+        let (start, end) = (range.start as usize, range.end as usize);
+        if end > self.0.len() || start > end {
+            return Err(Error::FileIndexFormatInvalid {
+                message: format!(
+                    "index byte range {start}..{end} out of bounds ({} bytes)",
+                    self.0.len()
+                ),
+            });
+        }
+        Ok(self.0.slice(start..end))
+    }
+}
+
 pub struct FileIndexFormatReader {
     reader: Box<dyn FileRead>,
     stat: FileStatus,
 }
 
 impl FileIndexFormatReader {
+    /// Parses an index blob held in memory — a manifest-embedded index, or a sidecar file the
+    /// caller already read whole.
+    pub async fn get_file_index_from_bytes(bytes: Bytes) -> crate::Result<FileIndex> {
+        let size = bytes.len() as u64;
+        let mut file_reader = Self {
+            reader: Box::new(BytesRead(bytes)),
+            stat: FileStatus {
+                size,
+                is_dir: false,
+                path: String::new(),
+                last_modified: None,
+            },
+        };
+        let header = file_reader.read_header().await?;
+        Ok(FileIndex {
+            header,
+            reader: file_reader.reader,
+        })
+    }
+
     pub async fn get_file_index(input_file: InputFile) -> crate::Result<FileIndex> {
         let reader = input_file.reader().await?;
         let mut file_reader = Self {

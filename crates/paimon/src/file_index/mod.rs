@@ -15,5 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod bloom_filter;
 mod file_index_format;
+pub use bloom_filter::*;
 pub use file_index_format::*;
