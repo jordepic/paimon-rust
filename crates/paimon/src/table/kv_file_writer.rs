@@ -27,6 +27,10 @@
 //! Reference: [org.apache.paimon.io.KeyValueDataFileWriterImpl](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/io/KeyValueDataFileWriterImpl.java)
 
 use crate::arrow::format::create_format_writer;
+use crate::file_index::{
+    fast_hash_bytes, fast_hash_long, write_column_indexes_with, BloomFilterIndexWriter,
+    BLOOM_FILTER_INDEX,
+};
 use crate::io::FileIO;
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
@@ -359,6 +363,119 @@ impl KeyValueFileWriter {
         })
     }
 
+    /// Writes the bloom-filter file index the table options request over primary-key columns —
+    /// RocksDB's flush-time filter discipline: a data file answers point misses from birth
+    /// instead of waiting for a compaction rewrite to attach an index. Sized by the file's
+    /// actual row count. Returns the sidecar's name for the file's `extra_files`, or nothing
+    /// when no requested column is a hashable primary key.
+    async fn write_key_bloom_index(
+        &self,
+        key_batch: &RecordBatch,
+        bucket_dir: &str,
+        file_name: &str,
+    ) -> Result<Vec<String>> {
+        let Some(columns) = self
+            .config
+            .table_options
+            .get("file-index.bloom-filter.columns")
+        else {
+            return Ok(vec![]);
+        };
+        let fpp = self
+            .config
+            .table_options
+            .get("file-index.bloom-filter.fpp")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.1);
+        let rows = key_batch.num_rows().max(1) as i64;
+        let mut indexes: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, bytes::Bytes>,
+        > = std::collections::HashMap::new();
+        for column in columns.split(',').map(str::trim) {
+            let Ok(idx) = key_batch.schema().index_of(column) else {
+                continue; // not a primary-key column; only keys serve the point probe
+            };
+            let array = key_batch.column(idx);
+            let mut writer = BloomFilterIndexWriter::new(rows, fpp);
+            let hashed = match array.data_type() {
+                ArrowDataType::Binary => {
+                    let a = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::BinaryArray>()
+                        .expect("binary key column");
+                    for row in 0..a.len() {
+                        if a.is_valid(row) {
+                            writer.add_hash(fast_hash_bytes(a.value(row)));
+                        }
+                    }
+                    true
+                }
+                ArrowDataType::LargeBinary => {
+                    let a = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::LargeBinaryArray>()
+                        .expect("large binary key column");
+                    for row in 0..a.len() {
+                        if a.is_valid(row) {
+                            writer.add_hash(fast_hash_bytes(a.value(row)));
+                        }
+                    }
+                    true
+                }
+                ArrowDataType::Utf8 => {
+                    let a = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .expect("string key column");
+                    for row in 0..a.len() {
+                        if a.is_valid(row) {
+                            writer.add_hash(fast_hash_bytes(a.value(row).as_bytes()));
+                        }
+                    }
+                    true
+                }
+                ArrowDataType::Int8 | ArrowDataType::Int16 | ArrowDataType::Int32
+                | ArrowDataType::Int64 | ArrowDataType::Date32 => {
+                    let a = arrow_cast::cast(array, &ArrowDataType::Int64).map_err(|e| {
+                        crate::Error::DataInvalid {
+                            message: format!("Failed to widen key column for bloom hash: {e}"),
+                            source: None,
+                        }
+                    })?;
+                    let a = a
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("widened key column");
+                    for row in 0..a.len() {
+                        if a.is_valid(row) {
+                            writer.add_hash(fast_hash_long(a.value(row)));
+                        }
+                    }
+                    true
+                }
+                _ => false, // no fast hash for the type: leave the column unindexed
+            };
+            if hashed {
+                indexes.entry(column.to_string()).or_default().insert(
+                    BLOOM_FILTER_INDEX.to_string(),
+                    bytes::Bytes::from(writer.serialize()),
+                );
+            }
+        }
+        if indexes.is_empty() {
+            return Ok(vec![]);
+        }
+        let index_file = format!("{file_name}.index");
+        write_column_indexes_with(
+            &self.file_io,
+            &format!("{bucket_dir}/{index_file}"),
+            indexes,
+        )
+        .await?;
+        Ok(vec![index_file])
+    }
+
     async fn write_indexed_file(
         &self,
         batch: &RecordBatch,
@@ -507,6 +624,9 @@ impl KeyValueFileWriter {
             &stats_col_indices,
             &self.config.primary_key_types,
         )?;
+        let extra_files = self
+            .write_key_bloom_index(&key_batch, &bucket_dir, &file_name)
+            .await?;
 
         Ok(DataFileMeta {
             file_name,
@@ -524,7 +644,7 @@ impl KeyValueFileWriter {
             max_sequence_number: write.max_sequence_number,
             schema_id: self.config.schema_id,
             level: 0,
-            extra_files: vec![],
+            extra_files,
             creation_time: Some(Utc::now()),
             delete_row_count: Some(write.delete_row_count),
             embedded_index: None,

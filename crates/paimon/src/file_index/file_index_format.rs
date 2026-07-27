@@ -102,6 +102,16 @@ pub async fn write_column_indexes(
     indexes: HashMap<String, HashMap<String, Bytes>>,
 ) -> crate::Result<OutputFile> {
     let file_io = FileIO::from_path(path)?.build()?;
+    write_column_indexes_with(&file_io, path, indexes).await
+}
+
+/// [`write_column_indexes`] against a caller-supplied [`FileIO`] — a table writer emitting an
+/// index sidecar must write through the table's own IO backend.
+pub async fn write_column_indexes_with(
+    file_io: &FileIO,
+    path: &str,
+    indexes: HashMap<String, HashMap<String, Bytes>>,
+) -> crate::Result<OutputFile> {
     let output = file_io.new_output(path)?;
     let mut writer = output.writer().await?;
 
